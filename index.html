@@ -496,63 +496,105 @@ function calcHFTLots({balance, dayStartBal, strength, slD, score, inst="XAUUSD",
     (dayUTC===5&&hourGMT>=20)||(dayUTC===0&&hourGMT<1.0)
   );
 
-  // ── BASE RISK: 5% of balance ───────────────────────────────────────
-  // This is the single source of truth. No stacking multipliers.
-  let riskDollars = balance * 0.05;
+  // ═══════════════════════════════════════════════════════════════
+  //  VOTE-DRIVEN GEOMETRIC LOT SIZER
+  //  Goal: meaningful profit per win that outweighs losses.
+  //
+  //  BASE RISK by vote count (of current balance):
+  //    2–3 votes  : 6%   — minimum entry, signal is borderline
+  //    4   votes  : 8%   — solid signal, size up
+  //    5   votes  : 10%  — strong, push harder
+  //    6+  votes  : 12%  — high conviction, maximum size
+  //
+  //  RECOVERY: after 2+ consecutive losses, the bot MUST make back
+  //  at least 2x the last loss. The lastLoss amount is tracked via
+  //  the streak object (streak.lastLossDollars). Recovery target risk
+  //  = max(normal risk, 2 × lastLoss), capped at 20% of balance.
+  //
+  //  PHASE GROWTH: risk % scales with how much the account has grown,
+  //  compounding wins into larger positions automatically.
+  //
+  //  CAPS: never risk >20% of balance, max 5.0 lots, margin safety.
+  // ═══════════════════════════════════════════════════════════════
+  const votes = score || Math.round((strength||40)/100 * MAX_SCORE);
 
-  // ── STRENGTH SCALING (replaces all the old boost multipliers) ─────
-  // Signal strength already encodes vote count + SETE weights + regime.
-  // Use it as the ONLY scaling factor on top of base risk.
-  const str = Math.max(strength||40, 30) / 100; // 0.30–1.00
-  if(str >= 0.80)      riskDollars *= 1.50; // strong: 7.5% of balance
-  else if(str >= 0.60) riskDollars *= 1.25; // good:   6.25%
-  else if(str < 0.40)  riskDollars *= 0.80; // weak:   4%
+  // ── BASE RISK % by vote count ────────────────────────────────────
+  let baseRiskPct;
+  if     (votes >= 6) baseRiskPct = 0.12;  // 12% — very high conviction
+  else if(votes >= 5) baseRiskPct = 0.10;  // 10% — strong
+  else if(votes >= 4) baseRiskPct = 0.08;  //  8% — solid
+  else                baseRiskPct = 0.06;  //  6% — borderline (minConf=3)
 
-  // ── PROTECTIVE REDUCTIONS ─────────────────────────────────────────
-  if(inDanger)      riskDollars *= 0.40;  // near daily stop: 2% risk
-  else if(inCaution)riskDollars *= 0.65;  // caution zone: 3.25%
-  if(inRecovery)    riskDollars *= 0.70;  // 3 losses: 3.5%
-  if(hmrActive)     riskDollars *= 0.50;  // HMR window: half size
+  // ── PHASE MULTIPLIER — account growth compounds lot sizes ────────
+  // growthRatio = current / sessionStart
+  const phMult = phase===3 ? 0.85   // SECURE (6x+): protect gains
+               : phase===2 ? 1.10   // COMPOUND (2–6x): ride the wave
+               :             1.00;  // BUILD (<2x): normal
 
-  // ── HARD CAPS ─────────────────────────────────────────────────────
-  // Absolute max: 8% of balance. Absolute min: $0.30 (commission floor).
-  riskDollars = Math.min(riskDollars, balance * 0.08);
-  riskDollars = Math.max(riskDollars, 0.30);
+  // ── HOT STREAK BOOST ─────────────────────────────────────────────
+  const streakMult = hotStreak ? 1.20 : 1.00; // +20% on 3+ consecutive wins
 
-  // ── ACCOUNT-SIZE ABSOLUTE CAPS ────────────────────────────────────
-  // Prevent any single trade from being oversized for account tier
-  const absMax = balance<100 ? balance*0.08   // $50 acct: max $4
-               : balance<300 ? balance*0.07   // $100-$299: max $21
-               : balance<1000? balance*0.06   // $300-$999: max $60
-               : balance*0.05;               // $1000+: 5% max
-  riskDollars = Math.min(riskDollars, absMax);
+  // ── COMPUTE BASE RISK DOLLARS ────────────────────────────────────
+  let riskDollars = balance * baseRiskPct * phMult * streakMult;
+
+  // ── RECOVERY MODE: target 2× the last loss ───────────────────────
+  // If 2+ consecutive losses, size next trade to recover at least
+  // 2x what was lost (at TP1 which closes 25% of position at 1.2×SL).
+  // Solving: lots × slD × 1.2 × pip × 0.25 >= 2 × lastLoss
+  //   → riskDollars_needed = 2 × lastLoss / (1.2 × 0.25) = 6.67 × lastLoss
+  // We target this as the risk budget so even a TP1 partial recoups 2× loss.
+  if(inRecovery){
+    const lastLoss = streak?.lastLossDollars || 0;
+    if(lastLoss > 0){
+      const recoveryTarget = lastLoss * 6.67; // TP1 partial will return 2×loss
+      riskDollars = Math.max(riskDollars, recoveryTarget);
+    } else {
+      riskDollars = Math.max(riskDollars, balance * 0.12); // floor at 12%
+    }
+  }
+
+  // ── CAPITAL PROTECTION REDUCTIONS ────────────────────────────────
+  if(inDanger)       riskDollars *= 0.40; // near daily stop: survival mode
+  else if(inCaution) riskDollars *= 0.70; // caution zone: 70% of normal
+  if(hmrActive)      riskDollars *= 0.60; // HMR window: 60% of normal
+
+  // ── HARD CAPS ────────────────────────────────────────────────────
+  // Max 20% of balance per trade (aggressive but bounded)
+  // Min: enough to cover commission ($9) and still profit
+  riskDollars = Math.min(riskDollars, balance * 0.20);
+  riskDollars = Math.max(riskDollars, 0.50); // absolute floor
 
   // ── LOT CALCULATION ───────────────────────────────────────────────
-  const effectiveSLD = Math.max(slD, 2.00); // min 2-pip SL floor
+  // Use actual slD — don't apply artificial floor that kills lots.
+  // If SL is tight (good!), that means bigger lots for same risk budget.
+  const effectiveSLD = Math.max(slD, 1.00); // 1-pip floor only
   const lotRaw = riskDollars / (effectiveSLD * pip);
 
-  // ── MARGIN GUARD ──────────────────────────────────────────────────
-  const goldPrice = livePrice||3300;
-  const marginPerLot = (goldPrice*100)/EXNESS_LEVERAGE;
-  const maxLotsMargin = (balance*0.20)/Math.max(marginPerLot,1); // max 20% margin usage
+  // ── MARGIN GUARD — Exness Zero 1:2000 ────────────────────────────
+  // margin per lot = (goldPrice × 100) / 2000
+  // At $4700 gold: ~$235/lot. At $3300 gold: ~$165/lot.
+  const goldPrice = livePrice || 4700;
+  const marginPerLot = (goldPrice * 100) / EXNESS_LEVERAGE;
+  const maxLotsMargin = (balance * 0.40) / Math.max(marginPerLot, 1);
 
   // ── ACCOUNT-SIZE LOT CAPS ─────────────────────────────────────────
-  const maxLotsByBal = balance<100  ? 0.20   // $50–$99: max 0.20 lots
-                     : balance<300  ? 0.60   // $100–$299: max 0.60 lots
-                     : balance<1000 ? 2.00   // $300–$999: max 2.00 lots
-                     : 4.00;                 // $1000+: max 4.00 lots
+  // Allow meaningful lot sizes at every account tier
+  const maxLotsByBal = balance < 100  ? 1.00   // $50–$99
+                     : balance < 300  ? 2.50   // $100–$299
+                     : balance < 1000 ? 5.00   // $300–$999
+                     : 10.00;                  // $1000+
 
   const lots = +Math.min(
     Math.max(lotRaw, MIN_LOT),
     maxLotsByBal,
     maxLotsMargin,
-    MAX_LOT_NORMAL
+    5.0          // absolute hard cap
   ).toFixed(4);
 
-  const riskPct = riskDollars/Math.max(balance,0.01);
+  const riskPct = riskDollars / Math.max(balance, 0.01);
   return{lots, riskDollars:+riskDollars.toFixed(2), riskPct,
          phase, hotStreak, inRecovery, hmrActive,
-         killMode:"BASE", equityGuard:inDanger?"REDUCE":"NORMAL"};
+         killMode:"VOTE", equityGuard:inDanger?"REDUCE":"NORMAL"};
 }
 
 // ── RISK TIERS (legacy — kept for compatibility) ───────────────────
@@ -1663,54 +1705,57 @@ function manageTrade(t, price, atr, liveProvider, pip=10){
   }
 
   // ── TRAILING STOP LOGIC ──────────────────────────────────────────
-  // Activation : price must reach EXACTLY 50% of entry→TP1 distance
-  //   BUY  activation price = entry + (tp1 - entry) × 0.50
-  //   SELL activation price = entry - (entry - tp1) × 0.50
+  // Activation: price reaches 50% of entry→TP1 distance (halfway to TP1)
   //
-  // Example: BUY @4300, SL @4280, TP1 @4380.10, TP2 @4440
-  //   activationPrice = 4300 + (4380.10 - 4300) × 0.50 = 4340.05
-  //   At 4340.05 → trail MUST snap to Breakeven (entry = 4300)
-  //   At 4380.10 → trail = entry + (price - entry) × 0.40
-  //             = 4300 + (4380.10 - 4300) × 0.40 = 4300 + 32.04 = 4332.04
+  //   BUY  example: entry=4700, SL=4680, TP1=4750
+  //     activationDist = (4750-4700)*0.50 = 25.00
+  //     Trail fires when price >= 4725.00
+  //     Step 1: SL snaps to entry (BE) = 4700 immediately
+  //     Step 2: SL follows price at 30% gap:
+  //       price=4730 → trailSL = 4700+(4730-4700)*0.30 = 4709
+  //       price=4760 → trailSL = 4700+(4760-4700)*0.30 = 4718
+  //       price=4800 → trailSL = 4700+(4800-4700)*0.30 = 4730 (ratchet)
   //
-  // Trail formula (post-activation):
-  //   BUY  trailSL = entry + (price − entry) × 0.40   [sits 40% up from entry]
-  //   SELL trailSL = entry − (entry − price) × 0.40   [sits 40% down from entry]
-  //   Ratchet — SL only ever moves in the profit direction, never back.
+  //   SELL example: entry=4700, TP1=4650
+  //     activationDist = (4700-4650)*0.50 = 25.00
+  //     Trail fires when price <= 4675.00
+  //
+  // Gap = 30% of (price - entry) distance — tight enough to protect gains,
+  // wide enough to not choke a good runner before TP2/TP3.
+  // Ratchet: SL ONLY moves in profit direction, never retreats.
 
-  // Activation distance = 50% of entry→TP1 distance
-  const tp1Dist=tr.tp1!=null?Math.abs(tr.tp1-tr.entry):Math.max((tr.slD||Math.abs(tr.entry-tr.sl)||2.0)*1.5,0.01);
-  const activationDist=tp1Dist*0.80; // trigger at 80% of TP1 — price is nearly there before BE
+  // Activation distance = exactly 50% of entry→TP1 distance
+  const tp1Dist=tr.tp1!=null
+    ? Math.abs(tr.tp1-tr.entry)
+    : Math.max((tr.slD||Math.abs(tr.entry-tr.sl)||2.0)*1.5, 0.01);
+  const activationDist = tp1Dist * 0.50; // ← 50% of TP1 distance, not 80%
 
   if(tr.dir==="BUY"){
-    const moved=price-tr.entry;
-    if(moved>=activationDist){
-      // Step 1: First-activation tick — snap SL to Breakeven, stop here.
-      // The 40% advancement starts on the NEXT price update.
+    const moved = price - tr.entry;
+    if(moved >= activationDist){
+      tr.trailing = true;
       if(!tr.beDone){
-        tr.sl=tr.entry; // exact BE
-        tr.beDone=true;
-        tr.trailing=true;
-      }else{
-        // Step 2: Post-activation — trail at 40% of total move from entry
-        // Ratchet: SL only advances toward profit, never retreats
-        const newSL=+(tr.entry+(price-tr.entry)*0.40).toFixed(2);
-        if(newSL>tr.sl)tr.sl=newSL;
+        // First activation: snap to exact Breakeven immediately
+        tr.sl = tr.entry;
+        tr.beDone = true;
+      } else {
+        // Post-BE: trail at 30% gap from entry→price move (ratchet)
+        const newSL = +(tr.entry + (price - tr.entry) * 0.30).toFixed(2);
+        if(newSL > tr.sl) tr.sl = newSL;
       }
     }
-  }else{
-    const moved=tr.entry-price;
-    if(moved>=activationDist){
-      // Step 1: First-activation tick — snap SL to Breakeven, stop here.
+  } else {
+    const moved = tr.entry - price;
+    if(moved >= activationDist){
+      tr.trailing = true;
       if(!tr.beDone){
-        tr.sl=tr.entry; // exact BE
-        tr.beDone=true;
-        tr.trailing=true;
-      }else{
-        // Step 2: Post-activation — trail at 40% of total move from entry
-        // Ratchet: SL only advances toward profit, never retreats
-        const newSL=+(tr.entry-(tr.entry-price)*0.40).toFixed(2);
-        if(newSL<tr.sl)tr.sl=newSL;
+        // First activation: snap to exact Breakeven immediately
+        tr.sl = tr.entry;
+        tr.beDone = true;
+      } else {
+        // Post-BE: trail at 30% gap from entry→price move (ratchet)
+        const newSL = +(tr.entry - (tr.entry - price) * 0.30).toFixed(2);
+        if(newSL < tr.sl) tr.sl = newSL;
       }
     }
   }
@@ -2799,14 +2844,19 @@ function App(){
                 seteRegime:addOnSig.seteRegime||null,
                 mktState:rMktState.current||"NORMAL",
               });
+              // TP1 re-entry — use same RR as original signal, apply full trail logic,
+              // and use the same vote-driven lot sizer (recovery sizing included).
+              const addRR = addOnSig.rr || [1.5, 3.0, 6.0];
               const addTrade={
                 ...addOnSig,
-                entry:addEntry,sl:addSL.sl,slD:addSL.slD,
-                tp1:+(t.dir==="BUY"?addEntry+addSL.slD*1.5:addEntry-addSL.slD*1.5).toFixed(2),
-                tp2:+(t.dir==="BUY"?addEntry+addSL.slD*3.0:addEntry-addSL.slD*3.0).toFixed(2),
-                tp3:+(t.dir==="BUY"?addEntry+addSL.slD*6.0:addEntry-addSL.slD*6.0).toFixed(2),
-                lots:+Math.min(Math.max(addLots,MIN_LOT),MAX_LOT_NORMAL).toFixed(4),
+                entry:addEntry, sl:addSL.sl, slD:addSL.slD,
+                tp1:+(t.dir==="BUY"?addEntry+addSL.slD*addRR[0]:addEntry-addSL.slD*addRR[0]).toFixed(2),
+                tp2:+(t.dir==="BUY"?addEntry+addSL.slD*addRR[1]:addEntry-addSL.slD*addRR[1]).toFixed(2),
+                tp3:+(t.dir==="BUY"?addEntry+addSL.slD*addRR[2]:addEntry-addSL.slD*addRR[2]).toFixed(2),
+                // Lots from full vote-driven sizer — no artificial cap
+                lots:+Math.min(Math.max(addLots,MIN_LOT),5.0).toFixed(4),
                 pnl:0,p1Done:false,p2Done:false,p3Done:false,
+                // Start trailing from scratch on new position (same 50%/30% rules)
                 trailing:false,beDone:false,posNum:2,isAddOn:true,
                 highWater:addEntry,lowWater:addEntry,
                 seteVotes:addOnSig.seteIds||[],seteRegime:addOnSig.seteRegime||"TRANSITION",
@@ -2848,7 +2898,13 @@ function App(){
           rPyramidLevel.current=0;rLastAddPrice.current=0;
           rEquityPeak.current=Math.max(rEquityPeak.current,rBalance.current);
           const prevStr=rStreak.current;
-          rStreak.current=won?(prevStr.dir==="W"?{cur:prevStr.cur+1,dir:"W"}:{cur:1,dir:"W"}):(prevStr.dir==="L"?{cur:prevStr.cur+1,dir:"L"}:{cur:1,dir:"L"});
+          rStreak.current=won
+            ?(prevStr.dir==="W"
+              ?{cur:prevStr.cur+1,dir:"W",lastLossDollars:prevStr.lastLossDollars||0}
+              :{cur:1,dir:"W",lastLossDollars:prevStr.lastLossDollars||0})
+            :(prevStr.dir==="L"
+              ?{cur:prevStr.cur+1,dir:"L",lastLossDollars:Math.max(Math.abs(pnl),prevStr.lastLossDollars||0)}
+              :{cur:1,dir:"L",lastLossDollars:Math.abs(pnl)});
           setStreak(rStreak.current);
           const h=Math.floor(hour),hs=rHourStats.current[h]||{trades:0,wins:0};
           rHourStats.current[h]={trades:hs.trades+1,wins:hs.wins+(won?1:0)};setHourStats({...rHourStats.current});
@@ -3117,9 +3173,10 @@ function App(){
 
       // Always 1 position — dual positions double risk on $50 accounts
       const numPos=1;
+      // No MAX_LOT_NORMAL cap — vote-sizer and margin guard are the real ceilings
       const lots=+Math.min(
         Math.max(+(rawLots*compositeMult/numPos).toFixed(4), MIN_LOT),
-        MAX_LOT_NORMAL
+        5.0   // absolute hard cap (5 lots)
       ).toFixed(4);
 
       // Use recalculated SL for the actual trade
@@ -3591,6 +3648,11 @@ function App(){
           if(t.seteVotes&&t.seteVotes.length>0){
             updateSETEPerformance(t.seteVotes,won,t.seteRegime||"TRANSITION");
           }
+          // Update streak + track lastLossDollars for recovery sizing
+          {const ps=rStreak.current;
+           rStreak.current=won
+             ?(ps.dir==="W"?{cur:ps.cur+1,dir:"W",lastLossDollars:ps.lastLossDollars||0}:{cur:1,dir:"W",lastLossDollars:ps.lastLossDollars||0})
+             :(ps.dir==="L"?{cur:ps.cur+1,dir:"L",lastLossDollars:Math.max(Math.abs(pnl),ps.lastLossDollars||0)}:{cur:1,dir:"L",lastLossDollars:Math.abs(pnl)});}
           rTrade.current=null;setTrade(null);setPhase("SCANNING");
           const icon=tickExit.result==="TRAIL"?"🎯":won?"✅":"❌";
           // Show last result as a separate flash (auto-clears in 4s), status goes back to Scanning
@@ -3648,7 +3710,7 @@ function App(){
                 hourGMT:hour2,seteRegime:t.seteRegime||null,
                 mktState:rMktState.current||"NORMAL",
               });
-              const lots2=+Math.min(Math.max(rawLots2,MIN_LOT),MAX_LOT_NORMAL).toFixed(4);
+              const lots2=+Math.min(Math.max(rawLots2,MIN_LOT),5.0).toFixed(4); // no MAX_LOT_NORMAL cap
               rTrade2.current={
                 dir:dir2,entry:entry2,sl:sl2,tp1:tp1_2,tp2:tp2_2,tp3:tp3_2,
                 slD:slD2,lots:lots2,strength:60,confirms:`TP1-ADD votes:${votes2}`,
